@@ -1,4 +1,4 @@
-# Collie Agent — Claude Code Build Prompt (v3)
+# Collie Agent — Claude Code Build Prompt (v3.1 — Lifecycle + CSM View)
 
 ---
 
@@ -20,9 +20,21 @@
 
 ## What You're Building
 
-Collie is an AI agent that watches customer interactions, enriches them with revenue data, creates Linear issues when it detects feature requests/bugs/churn signals, monitors those issues through completion, and automatically notifies customers when their requested features ship.
+Collie is an AI agent that watches customer interactions, enriches them with revenue data, creates Linear issues when it detects feature requests/bugs/churn signals, tracks those issues through their full engineering lifecycle, and helps close the loop with customers at every stage — not just when features ship.
 
 It is NOT a dashboard-first product. It is an always-on background agent with a lightweight web interface for configuration, review, and override.
+
+## Two Personas, One Product
+
+Collie serves two personas with the same data and agent:
+
+**The Technical Founder ($500K-$3M ARR, no dedicated CS):**
+Wants maximum automation. Set it and forget it. Agent watches Intercom, files Linear issues, detects ships, sends notifications. They check the dashboard once a day, approve notification drafts, done. The agent replaces the CS function they can't afford to hire.
+
+**The CSM ($3-10M ARR, 1-3 person CS team):**
+Wants a command center for their accounts. Opens Collie each morning and sees: which of my accounts have open requests, where does each request stand in engineering right now, what moved overnight, what's been stale for 30+ days, which customers should I proactively reach out to today? They don't want notifications sent automatically — they want to know it's TIME to reach out, with AI-drafted context so they can do it well.
+
+**Same agent, same data, different daily workflow.** The founder uses the agent log and feedback list. The CSM uses the "My Accounts" view and notification queue. The architecture doesn't change — the Linear webhook already fires on every status change. The difference is whether you throw away non-Done events or track the full lifecycle.
 
 ## Core Architecture Principle: Tool-Agnostic Agent, Tool-Specific Adapters
 
@@ -376,6 +388,13 @@ CREATE TABLE notifications (
   org_id UUID REFERENCES organizations(id) NOT NULL,
   customer_id UUID REFERENCES customers(id) NOT NULL,
   feedback_id UUID REFERENCES feedback(id) NOT NULL,
+  trigger_type TEXT NOT NULL CHECK (trigger_type IN (
+    'shipped',           -- issue moved to Done/Shipped
+    'in_progress',       -- issue moved to In Progress (proactive update)
+    'stale_request',     -- issue stuck in Backlog/Todo for N days
+    'customer_followup', -- customer asked about existing request again
+    'manual'             -- user manually triggered a notification
+  )),
   subject TEXT NOT NULL,
   body_html TEXT NOT NULL,
   body_plain TEXT NOT NULL,
@@ -385,6 +404,33 @@ CREATE TABLE notifications (
   approved_by UUID REFERENCES users(id),
   sent_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Issue lifecycle events (tracks every status change, not just Done)
+CREATE TABLE feedback_status_history (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  feedback_id UUID REFERENCES feedback(id) NOT NULL,
+  old_status TEXT,
+  new_status TEXT NOT NULL,
+  changed_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX idx_feedback_status_history ON feedback_status_history(feedback_id, changed_at DESC);
+
+-- Notification trigger configuration per org
+-- Controls which lifecycle events generate notification drafts
+CREATE TABLE notification_triggers (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id UUID REFERENCES organizations(id) NOT NULL,
+  trigger_type TEXT NOT NULL CHECK (trigger_type IN ('shipped', 'in_progress', 'stale_request')),
+  enabled BOOLEAN DEFAULT true,
+  config JSONB DEFAULT '{}',
+  -- config examples:
+  -- shipped: {} (no config needed, always fires)
+  -- in_progress: {} (fires when issue moves to In Progress)
+  -- stale_request: { "days_threshold": 30 } (fires when backlog > N days)
+  created_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(org_id, trigger_type)
 );
 ```
 
@@ -680,40 +726,181 @@ export async function executeActions(
 }
 ```
 
-## Ship Detection + Notifications
+## Issue Lifecycle Tracking + Notifications
 
-### Linear Webhook
+### Linear Webhook (Processes ALL Status Changes)
+
+The Linear webhook fires on every issue update. The old spec only processed "Done." Now we track the full lifecycle:
 
 ```typescript
 // /api/webhooks/linear/route.ts
-// When issue moves to Done/Shipped:
-// 1. Verify signature
-// 2. Check if status is in org's shipped_statuses config
-// 3. Find feedback records linked via issue_tracker_id
-// 4. For each: set shipped_at, generate notification draft
-// 5. Notification defaults to_email = feedback.requester_email
-//    Reviewer can change before approving
+
+export async function POST(req: Request) {
+  // 1. Verify Linear webhook signature
+  // 2. Extract issue ID, old status, new status
+  const body = await req.json();
+  const issueId = body.data?.id;
+  const newStatus = body.data?.state?.name;   // "Backlog", "Todo", "In Progress", "In Review", "Done"
+  const oldStatus = body.updatedFrom?.state?.name;
+
+  if (!issueId || !newStatus) return Response.json({ ok: true });
+
+  // 3. Find feedback records linked to this issue
+  const feedbackItems = await supabase
+    .from('feedback').select('*, customers(*)')
+    .eq('issue_tracker_id', issueId);
+
+  if (!feedbackItems.data?.length) return Response.json({ ok: true });
+
+  const orgId = feedbackItems.data[0].org_id;
+
+  for (const feedback of feedbackItems.data) {
+    // 4. ALWAYS update the tracked status
+    await supabase.from('feedback').update({
+      issue_tracker_status: newStatus,
+      updated_at: new Date().toISOString(),
+    }).eq('id', feedback.id);
+
+    // 5. Record in status history (for timeline view)
+    await supabase.from('feedback_status_history').insert({
+      feedback_id: feedback.id,
+      old_status: oldStatus || null,
+      new_status: newStatus,
+    });
+
+    // 6. Check notification triggers
+    const triggers = await getEnabledTriggers(orgId);
+
+    // SHIPPED: issue moved to Done/Shipped
+    const shippedStatuses = integration?.config?.shipped_statuses || ['Done', 'Shipped'];
+    if (shippedStatuses.includes(newStatus)) {
+      await supabase.from('feedback').update({ shipped_at: new Date().toISOString() })
+        .eq('id', feedback.id);
+
+      if (triggers.shipped && feedback.customer_id) {
+        await generateNotification(orgId, feedback, 'shipped');
+      }
+    }
+
+    // IN PROGRESS: issue started being worked on
+    const inProgressStatuses = ['In Progress', 'Started'];
+    if (inProgressStatuses.includes(newStatus) && !inProgressStatuses.includes(oldStatus)) {
+      if (triggers.in_progress && feedback.customer_id) {
+        await generateNotification(orgId, feedback, 'in_progress');
+      }
+    }
+
+    // Log every status change
+    await logAgent(orgId, 'issue_status_changed', feedback.customer_id, feedback.id,
+      `${oldStatus || '?'} → ${newStatus}`);
+  }
+
+  return Response.json({ ok: true });
+}
 ```
 
-### Notification Generation
+### Stale Request Detection (Cron Job)
+
+Runs daily via Vercel Cron. Finds requests stuck in Backlog/Todo beyond the org's threshold:
 
 ```typescript
-const notificationSystemPrompt = `Write a short, warm email telling a customer their requested feature shipped.
-
-Rules:
-- 3-5 sentences max
-- Reference their specific request
-- Gratitude for feedback
-- Clear CTA (try it out, changelog link)
-- Human tone, not corporate marketing
-- Never use: "We're excited", "We're thrilled", "We value your feedback"
-
-Return JSON only:
-{ "subject": "...", "body_html": "...", "body_plain": "..." }`;
-
-// Default to_email: feedback.requester_email (the person who wrote to support)
-// Reviewer can change in the notification queue UI before approving
+// /api/cron/stale-requests/route.ts
+// Runs daily
+// 1. For each org with stale_request trigger enabled:
+// 2. Find feedback where:
+//    - issue_tracker_status IN ('Backlog', 'Todo')
+//    - created_at < now() - stale_threshold_days (default 30)
+//    - no stale notification already sent for this feedback
+// 3. For each: generate notification with trigger_type = 'stale_request'
+// 4. Log to agent_log
 ```
+
+### Customer Follow-up Detection
+
+When the agent processes a new InboundMessage and classifies it as `escalate_existing`, it generates a notification draft:
+
+```typescript
+// In /lib/agent/execute.ts, inside the escalate_existing case:
+case 'escalate_existing': {
+  if (action.feedback_id) {
+    await escalateExistingFeedback(action.feedback_id, action.reason);
+
+    // Generate a follow-up notification draft with current status context
+    const existingFeedback = await getFeedback(action.feedback_id);
+    if (existingFeedback && triggers.customer_followup !== false) {
+      await generateNotification(orgId, existingFeedback, 'customer_followup');
+    }
+  }
+  break;
+}
+```
+
+### Notification Generation (Expanded)
+
+Now handles multiple trigger types with different tones:
+
+```typescript
+const notificationPrompts: Record<string, string> = {
+
+  shipped: `Write a short, warm email telling a customer that a feature they requested has shipped.
+Rules: 3-5 sentences. Reference their specific request. Gratitude. Clear CTA (try it out).
+Human tone, not corporate. Never: "We're excited", "We're thrilled".`,
+
+  in_progress: `Write a short proactive email letting a customer know their request is now being actively worked on.
+Rules: 2-3 sentences. Reference their specific request. Set expectation that you'll update them again when it ships.
+Tone: helpful colleague giving a heads-up, not a corporate status update.`,
+
+  stale_request: `Write an honest, brief email updating a customer on a request that hasn't progressed yet.
+Rules: 2-3 sentences. Acknowledge the delay without over-apologizing. Confirm it's still on the radar.
+Be honest — don't promise a timeline if there isn't one. Tone: transparent and respectful.`,
+
+  customer_followup: `Write a brief email responding to a customer who asked about the status of a previous request.
+Rules: 2-3 sentences. Reference where the request currently stands in engineering.
+Include the current status (Backlog/Todo/In Progress). Be honest about timeline if unknown.
+Tone: responsive and informed — the CSM who actually knows what's going on.`,
+};
+
+export async function generateNotification(
+  orgId: string,
+  feedback: Feedback,
+  triggerType: 'shipped' | 'in_progress' | 'stale_request' | 'customer_followup'
+) {
+  const customer = await getCustomer(feedback.customer_id);
+
+  const userMessage = `
+Customer: ${customer.name} ($${customer.arr || '?'} ARR)
+Their original request: "${feedback.raw_text}"
+Request title: ${feedback.title}
+Current engineering status: ${feedback.issue_tracker_status || 'Unknown'}
+Days since request: ${daysSince(feedback.created_at)}
+${triggerType === 'shipped' ? `What was built: ${feedback.detail}` : ''}
+`;
+
+  const response = await anthropic.messages.create({
+    model: AI_MODELS.notification,
+    max_tokens: 1024,
+    system: notificationPrompts[triggerType],
+    messages: [{ role: 'user', content: userMessage }],
+  });
+
+  const result = JSON.parse(response.content[0].text);
+
+  await supabase.from('notifications').insert({
+    org_id: orgId,
+    customer_id: feedback.customer_id,
+    feedback_id: feedback.id,
+    trigger_type: triggerType,
+    subject: result.subject,
+    body_html: result.body_html,
+    body_plain: result.body_plain,
+    to_email: feedback.requester_email || customer.account_owner || '',
+    to_name: feedback.requester_name || customer.name,
+    status: 'draft',
+  });
+}
+```
+
+All notification drafts go to the same queue. The reviewer sees the trigger type, can edit everything, and approves. The CSM might get 5 drafts in their queue each morning: 1 shipped notification, 2 proactive "in progress" updates, 1 stale request check-in, 1 follow-up response. They review each, personalize if needed, and send. Whole morning routine takes 15 minutes instead of 2 hours of checking Linear + drafting emails manually.
 
 ## Test Harness
 
@@ -794,13 +981,15 @@ app/
 ├── api/
 │   ├── webhooks/
 │   │   ├── intercom/route.ts      ← Intercom → InboundMessage → processInboundMessage
-│   │   └── linear/route.ts        ← Ship detection
+│   │   └── linear/route.ts        ← ALL status changes: update tracker, trigger notifications
 │   ├── inbound/
 │   │   └── message/route.ts       ← Generic API (authenticated via org API key)
 │   ├── agent/
-│   │   └── classify/route.ts      ← Agent brain (called by processInboundMessage)
+│   │   └── classify/route.ts      ← Agent brain
 │   ├── sync/
 │   │   └── hubspot/route.ts       ← Cron: HubSpot → customers table
+│   ├── cron/
+│   │   └── stale-requests/route.ts ← Daily: find stale requests, generate notification drafts
 │   ├── customers/
 │   │   ├── route.ts               ← CRUD + list
 │   │   ├── [id]/route.ts
@@ -808,25 +997,97 @@ app/
 │   ├── feedback/
 │   │   ├── route.ts               ← CRUD + list
 │   │   ├── [id]/route.ts
-│   │   └── [id]/assign/route.ts   ← Assign unmatched → customer
+│   │   ├── [id]/assign/route.ts   ← Assign unmatched → customer
+│   │   └── [id]/history/route.ts  ← Status change history for timeline view
 │   ├── notifications/
-│   │   ├── generate/route.ts
-│   │   ├── approve/route.ts       ← Reviewer can edit to_email
+│   │   ├── generate/route.ts      ← AI drafts (shipped, in_progress, stale, followup)
+│   │   ├── approve/route.ts       ← Reviewer can edit to_email + content
 │   │   └── send/route.ts          ← Resend
 │   └── org/
-│       └── api-key/route.ts
+│       ├── api-key/route.ts
+│       └── notification-triggers/route.ts  ← Configure which lifecycle events generate drafts
 ├── (dashboard)/
-│   ├── page.tsx                   ← Dashboard
-│   ├── feedback/                  ← Feedback list + detail
-│   ├── customers/                 ← Customer list + detail + import
-│   ├── notifications/             ← Queue: review, edit to_email, approve, send
-│   ├── unmatched/                 ← Unmatched feedback → assign to customers
-│   ├── agent-log/                 ← Agent activity log
-│   ├── test/                      ← Test harness + demo
-│   └── settings/                  ← Integrations, agent config, API key
+│   ├── page.tsx                   ← Dashboard: activity feed, pending reviews, unmatched count
+│   ├── accounts/                  ← CSM VIEW: "My Accounts"
+│   │   ├── page.tsx               ← Account list with open request counts + status summary
+│   │   └── [id]/page.tsx          ← Account detail: requests, statuses, timeline, outreach queue
+│   ├── feedback/
+│   │   ├── page.tsx               ← Feedback list sorted by ARR (founder view)
+│   │   └── [id]/page.tsx          ← Feedback detail + status history timeline
+│   ├── customers/
+│   │   ├── page.tsx               ← Customer list with state indicators
+│   │   ├── [id]/page.tsx          ← Customer detail with timeline
+│   │   └── import/page.tsx        ← CSV import UI
+│   ├── notifications/
+│   │   └── page.tsx               ← Queue: review, edit, approve (all trigger types)
+│   ├── unmatched/
+│   │   └── page.tsx               ← Unmatched feedback → assign to customers
+│   ├── agent-log/
+│   │   └── page.tsx               ← Agent activity log
+│   ├── test/
+│   │   └── page.tsx               ← Test harness + demo
+│   └── settings/
+│       ├── page.tsx               ← General settings
+│       ├── integrations/page.tsx  ← Connect HubSpot, Linear, Intercom + API key
+│       ├── agent/page.tsx         ← Agent config: confidence threshold, model
+│       └── triggers/page.tsx      ← Notification triggers: which events generate drafts
 ├── (auth)/
 └── layout.tsx
 ```
+
+## The "My Accounts" View (CSM Command Center)
+
+This is the view a CSM opens every morning. Same data as the feedback list, different lens.
+
+```
+/app/(dashboard)/accounts/page.tsx
+
+┌─────────────────────────────────────────────────────────────────┐
+│  My Accounts                                    [Filter ▼] [⟳] │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  🔴 Acme Corp     $85K ARR    Renewal: Apr 15            │  │
+│  │  ├─ "Bulk export"          In Progress  (moved yesterday)│  │
+│  │  │  └─ 📧 Draft ready: proactive update                  │  │
+│  │  └─ "SSO support"          Backlog      38 days stale    │  │
+│  │     └─ ⚠️ Draft ready: stale request check-in            │  │
+│  │  Sentiment: declining ↘                                   │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  🟡 Globex Inc    $120K ARR   Renewal: Jul 1             │  │
+│  │  ├─ "Multi-file upload"    In Review   (since Feb 12)    │  │
+│  │  └─ "API rate limits"      Done ✓      Shipped Feb 10    │  │
+│  │     └─ 📧 Draft ready: ship notification                 │  │
+│  │  Sentiment: stable ─                                      │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  🟢 Initech       $45K ARR    Renewal: Sep 30            │  │
+│  │  └─ No open requests                                     │  │
+│  │  Sentiment: improving ↗                                   │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  Sorted by: [Action needed ▼]  (accounts with drafts first,    │
+│  then declining sentiment, then renewal soonest)                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**What makes this view work:**
+- Grouped by account, not by feedback item (CSM thinks in accounts, not tickets)
+- Each account shows its open requests with CURRENT engineering status from Linear
+- Pending notification drafts are surfaced inline — "you have a draft to review for this account"
+- Default sort: action needed first (accounts with pending drafts or declining sentiment)
+- Sentiment badge and trend arrow from the agent's customer state
+- Renewal date prominent — urgency context at a glance
+- Click into account → full timeline: every interaction, every status change, every notification sent
+
+**Account detail page** (`/accounts/[id]/page.tsx`):
+- Header: name, ARR, tier, renewal, sentiment, account owner
+- **Request tracker:** table of all open requests with current Linear status, days open, last status change
+- **Timeline:** chronological feed of everything — Intercom messages, status changes, notifications sent, agent actions
+- **Outreach queue:** pending notification drafts for this account, approve/edit/send inline
+- **Shipped history:** what Collie delivered for this customer (for QBR conversations)
 
 ## Build Order (Agent First, Data Import Second)
 
@@ -860,36 +1121,43 @@ app/
 7. Register Intercom webhook (ngrok for local dev)
 8. **Verify: real Intercom message → feedback + Linear issue with ARR**
 
-### Phase 4: Ship Detection + Notifications (Days 14-17)
-1. Linear webhook → ship detection
-2. Match shipped issues → feedback records
-3. Notification generation (Sonnet)
-4. Notification queue UI (review, edit to_email, approve)
-5. Resend email delivery
-6. **Verify: Linear Done → draft → edit recipient → approve → email sends**
+### Phase 4: Issue Lifecycle + Notifications (Days 14-17)
+1. Linear webhook: process ALL status changes, update `issue_tracker_status` on every event
+2. `feedback_status_history` table: record every transition for timeline view
+3. Ship detection: when status = Done → mark `shipped_at`
+4. Notification generation with multiple trigger types (shipped, in_progress, stale, followup)
+5. Notification trigger config in settings: which events generate drafts
+6. Notification queue UI: review drafts (shows trigger type), edit to_email + content, approve
+7. Resend email delivery
+8. **Verify: Linear status change → feedback status updates → appropriate notification draft generated**
 
-### Phase 5: Web UI (Days 18-22)
-1. Dashboard: activity feed, pending reviews, unmatched count
-2. Feedback list: filters, sort by ARR
-3. Unmatched feedback page: assign to customers
-4. Customer list + detail with timeline
-5. Notification queue + sent history
-6. Agent log
-7. Org API key in settings
+### Phase 5: Web UI (Days 18-23)
+1. Dashboard: activity feed, pending reviews, unmatched count, notification drafts pending
+2. **"My Accounts" view:** account list grouped by customer, open requests with current Linear status, pending drafts inline, sorted by action-needed. This is the CSM's daily driver.
+3. **Account detail page:** request tracker + timeline + outreach queue + shipped history
+4. Feedback list: filters (type, urgency, status, tracker status), sort by ARR (founder view)
+5. Feedback detail: includes status change history timeline from `feedback_status_history`
+6. Unmatched feedback page: assign to customers
+7. Customer list + detail (may overlap with accounts view — accounts is the richer version)
+8. Notification queue: shows trigger type badge, approve/edit/send, sent history
+9. Agent log: chronological, filterable
+10. Settings: notification triggers config (which lifecycle events generate drafts), stale threshold
+11. Org API key in settings
+12. Stale request cron job: `/api/cron/stale-requests` (Vercel Cron, daily)
 
-### Phase 6: Hardening (Days 23-25)
+### Phase 6: Hardening (Days 24-27)
 1. Webhook signature verification
-2. Rate limiting
+2. Rate limiting on API routes
 3. Retry logic for external APIs
 4. Row-level security (org_id scoping)
 5. Error handling for unparseable AI JSON
-6. Deploy to Vercel + Cron for HubSpot sync
+6. Deploy to Vercel + Cron for HubSpot sync (every 6 hours) + stale request check (daily)
 
 ## What to Build / What to Skip
 
-**Build for v1:** Agent core, test harness, Intercom adapter, generic inbound API, HubSpot sync, CSV import, Linear issues, Linear ship detection, notifications, customer matching with fallbacks, unmatched queue, idempotency.
+**Build for v1:** Agent core, test harness, Intercom adapter, generic inbound API, HubSpot sync, CSV import, Linear issues, **full Linear lifecycle tracking (all status changes)**, notifications with **multiple trigger types (shipped, in_progress, stale, followup)**, **"My Accounts" CSM view**, customer matching with fallbacks, unmatched queue, idempotency, **stale request cron**, **notification trigger configuration**.
 
-**Skip for v1:** Zendesk/Freshdesk/Slack adapters (build when prospect needs), Salesforce/Stripe sync (build when prospect needs), Jira (build when prospect needs), contacts table (requester fields sufficient), async queue (build if timeouts), desktop app (indefinitely), QBR, health dashboard, Slack notifications, customer portal, mobile app.
+**Skip for v1:** Zendesk/Freshdesk/Slack adapters (build when prospect needs), Salesforce/Stripe sync (build when prospect needs), Jira (build when prospect needs), contacts table (requester fields sufficient), async queue (build if timeouts), desktop app (indefinitely), QBR generation (v1.2 — but shipped history on account page is the data foundation), health dashboard (accounts view sorted by sentiment IS the health view), Slack notifications to users, customer portal, mobile app.
 
 **Adding a new tool later:**
 - New support tool (Zendesk): 1 new file, transforms payload → InboundMessage. 4-6 hours.
@@ -911,7 +1179,7 @@ LINEAR_WEBHOOK_SECRET=
 NEXT_PUBLIC_APP_URL=
 ```
 
-## Success Criteria (25 Days)
+## Success Criteria (27 Days)
 
 - [ ] Test harness: type message → correct AgentDecision with reasoning
 - [ ] HubSpot OR CSV → customers appear with ARR
@@ -919,9 +1187,13 @@ NEXT_PUBLIC_APP_URL=
 - [ ] >80% classification accuracy (human review)
 - [ ] Unmatched feedback (gmail users) appears in queue, not silently dropped
 - [ ] Linear issues include: customer name, ARR, source link, reasoning
-- [ ] Ship detection: Linear Done → notification draft
-- [ ] Notification defaults to requester email, reviewer can change
-- [ ] Notifications are personalized, not generic
+- [ ] **Linear status changes tracked in real time** — feedback.issue_tracker_status always current
+- [ ] **"My Accounts" view shows:** accounts grouped with open requests, current Linear status, pending drafts
+- [ ] Ship detection: Linear Done → shipped notification draft
+- [ ] **In Progress detection:** Linear In Progress → proactive update draft
+- [ ] **Stale detection:** request in Backlog >30 days → honest update draft
+- [ ] **Customer follow-up:** agent detects escalation → status update draft with current position
+- [ ] Notification drafts show trigger type, reviewer can edit to_email + content
 - [ ] Duplicate webhooks don't create duplicates (idempotency)
 - [ ] Agent log shows reasoning for every action
 - [ ] Generic API works: POST InboundMessage → processed
