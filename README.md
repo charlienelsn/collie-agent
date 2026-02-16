@@ -1,1 +1,1 @@
-# collie-agent
+# Collie Agent
